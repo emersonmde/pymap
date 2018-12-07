@@ -4,6 +4,12 @@ import socket, sys, struct, re, os
 from enum import IntFlag
 
 def read_services():
+    """
+    Reads a services TSV file, sorts on rank, and then returns the top 1000 services
+
+    You can use nmap-services or any TSV in the format:
+    SERVICE_NAME\tPORT_NUMBER/PROTOCOL\tRANK
+    """
     services = []
     f = open('data/pymap-services')
     for line in f:
@@ -15,6 +21,31 @@ def read_services():
     f.close()
     services.sort(key=lambda i: i[3], reverse=True)
     return services[:1000]
+
+def send_tcp_syn():
+    dest = 'localhost'
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    except socket.error as msg:
+        print('Socket error: %s' % msg)
+        print('Requires root to create ICMP socket')
+        exit(1)
+
+    packet = ''
+    
+    dest_ip = socket.gethostbyname(dest)
+    #source_ip = '10.0.0.244'
+    source_ip = dest_ip
+    source_port = 1234
+    dest_port = 3000 
+    source = (source_ip, source_port)
+    dest = (dest_ip, dest_port)
+
+    packet = TCPIPHeader(source = source, dest = dest, flags = TCPFlag.SYN).packet
+
+    sock.sendto(packet, (dest_ip, 1))
+
 
 def checksum(data):
     """
@@ -37,7 +68,88 @@ def checksum(data):
     total = ~total & 0xffff
     return total >> 8 | (total << 8 & 0xff00)
 
-class TCP(IntFlag):
+class IPHeader:
+    """IP Protocol Header"""
+    def __init__(
+            self,
+            source_addr,
+            dest_addr,
+            total_len = 40,
+            id = os.getpid() & 0xffff,
+            flags = 0,
+            frag_offset = 0,
+            ttl = 255,
+            protocol = socket.IPPROTO_TCP):
+        """
+        IP Header
+
+        Version: 4 bits
+        Internet Header Length (IHL): 4 bits
+        Differentiated Services Code Point (DSCP/ToS): 6 bits
+        Explicit Congestion Notification (ESN): 2 bits
+        Total Length: 16 bits
+        Identification: 16 bits
+        Flags: 3 bits
+        Fragment Offset: 13 bits
+        TTL: 8 bits
+        Protocol: 8 bits
+        Checksum: 16 bits
+        Source Address: 32 bits
+        Destination Address: 32 bits
+        """
+        self.version = 4
+        self.ihl = 5
+        self.dscp = 0
+        self.ecn = 0
+        self.total_len = total_len 
+        self.id = id
+        self.flags = 0
+        self.frag_offset = frag_offset
+        self.ttl = ttl
+        self.protocol = protocol
+        self.cs = 0
+        self.source = socket.inet_aton(source_addr)
+        self.dest = socket.inet_aton(dest_addr)
+        
+        # Combine some fields to get 8 bit boundaries
+        self.version_ihl = (self.version << 4) | (self.ihl & 0xff)
+        self.dscp_ecn = (self.dscp << 2) | (self.ecn & 0xf)
+        self.flags_frag_offset = (self.flags << 13) | (self.frag_offset & 0x1fff)
+
+    def pack(self):
+        """Pack the IP header values into a byte string"""
+        header = struct.pack(
+                "!BBHHHBBH4s4s",
+                self.version_ihl,
+                self.dscp_ecn,
+                self.total_len,
+                self.id,
+                self.flags_frag_offset,
+                self.ttl,
+                self.protocol,
+                self.cs,
+                self.source,
+                self.dest)
+
+        self.cs = checksum(header)
+
+        return struct.pack(
+                "!BBHHHBBH4s4s",
+                self.version_ihl,
+                self.dscp_ecn,
+                self.total_len,
+                self.id,
+                self.flags_frag_offset,
+                self.ttl,
+                self.protocol,
+                self.cs,
+                self.source,
+                self.dest)
+
+class TCPFlag(IntFlag):
+    """
+    TCP Flags
+    """
     NS = 0x100
     CWR = 0x080
     ECE = 0x040
@@ -48,108 +160,114 @@ class TCP(IntFlag):
     SYN = 0x002
     FIN = 0x001
 
+class TCPHeader:
+    """TCP Protocol Header"""
+    def __init__(self, source_port, dest_port, seq = 0, ack = 0, data_offset = 5, flags = 0, window = 5840):
+        """
+        # TCP Header
+        # Source Port: 16 bits
+        # Destination Port: 16 bits
+        # Sequence Number: 32 bits
+        # Acknowledgment Number (if ACK set): 32 bits
+        # Data Offset in 32 bit words: 4 bits
+        # Reserved: 3 bits
+        # Flags: 9 bits
+        # Window Size in Bytes: 16 bits
+        # Checksum: 16 bits
+        # Urgent Pointer: 16 bits
+        # Options (if data offset > 5: padded at the end with "0" bytes): 0-320 bits, divisible by 32
+        """
+        self.source_port = source_port
+        self.dest_port = dest_port
+        self.seq = seq
+        self.ack = ack
+        self.data_offset = data_offset
+        self.reserved = 0
+        self.flags = flags
+        self.window = socket.htons(window)
+        self.cs = 0
+        self.urgent_ptr = 0
 
-def send_tcp_syn():
-    dest = 'localhost'
+        # Combine fields to get 8 bit boundary
+        self.data_offset_flags = (self.data_offset << 12) | self.flags
 
-    try:
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-    except socket.error as msg:
-        print('Socket error: %s' % msg)
-        print('Requires root to create ICMP socket')
-        exit(1)
+    def pack(self, source_addr, dest_addr, protocol = socket.IPPROTO_TCP):
+        """
+        Packs TCP header values into a byte string
 
-    packet = ''
-    
-    dest_ip = socket.gethostbyname(dest)
-    #source_ip = '10.0.0.244'
-    source_ip = dest_ip
+        Uses a pseudo header to calculate the checksum
 
-    # IP header fields
-    # Version: 4 bits
-    # Internet Header Length (IHL): 4 bits
-    # Differentiated Services Code Point (DSCP/ToS): 6 bits
-    # Explicit Congestion Notification (ESN): 2 bits
-    # Total Length: 16 bits
-    # Identification: 16 bits
-    # Flags: 3 bits
-    # Fragment Offset: 13 bits
-    # TTL: 8 bits
-    # Protocol: 8 bits
-    # Checksum: 16 bits
-    # Source Address: 32 bits
-    # Destination Address: 32 bits
-    ip_version = 4
-    ip_ihl = 5
-    ip_dscp = 0
-    ip_ecn = 0
-    ip_total_len = 40
-    ip_id = os.getpid() & 0xffff
-    ip_flags = 0
-    ip_frag_offset = 0
-    ip_ttl = 255
-    ip_proto = socket.IPPROTO_TCP
-    ip_cs = 0
-    ip_source_addr = socket.inet_aton(source_ip)
-    ip_dest_addr = socket.inet_aton(dest_ip)
+        TCP Pseudo Header Layout:
+        Source Address: 32 bits
+        Destination Address: 32 bits
+        Padding: 8 bits
+        Protocol: 8 bits
+        TCP Header Length (including Payload) in Bytes: 16 bits
+        """
+        source_ip = socket.inet_aton(source_addr)
+        dest_ip = socket.inet_aton(dest_addr)
 
-    ip_version_ihl = (ip_version << 4) | (ip_ihl & 0xff)
-    ip_dscp_ecn = (ip_dscp << 2) | (ip_ecn & 0xf)
-    ip_flags_frag_offset = (ip_flags << 13) | (ip_frag_offset & 0x1fff)
+        header = struct.pack(
+                "!HHLLHHHH",
+                self.source_port,
+                self.dest_port,
+                self.seq,
+                self.ack,
+                self.data_offset_flags,
+                self.window,
+                self.cs,
+                self.urgent_ptr)
 
-    print("!BBHHHBBHLL", ip_version_ihl, ip_dscp_ecn, ip_total_len, ip_id, ip_flags_frag_offset, ip_ttl, ip_proto, ip_cs, ip_source_addr, ip_dest_addr)
-    ip_header = struct.pack("!BBHHHBBH4s4s", ip_version_ihl, ip_dscp_ecn, ip_total_len, ip_id, ip_flags_frag_offset, ip_ttl, ip_proto, ip_cs, ip_source_addr, ip_dest_addr)
+        pseudo_header = struct.pack("!4s4sBBH", source_ip, dest_ip, 0, protocol, len(header))
+        
+        combined_header = pseudo_header + header
 
-    ip_cs = checksum(ip_header)
+        self.cs = checksum(combined_header)
 
-    ip_header = struct.pack("!BBHHHBBH4s4s", ip_version_ihl, ip_dscp_ecn, ip_total_len, ip_id, ip_flags_frag_offset, ip_ttl, ip_proto, ip_cs, ip_source_addr, ip_dest_addr)
+        return struct.pack(
+                "!HHLLHHHH",
+                self.source_port,
+                self.dest_port,
+                self.seq,
+                self.ack,
+                self.data_offset_flags,
+                self.window,
+                self.cs,
+                self.urgent_ptr)
 
-    # TCP Header Fields
-    # Source Port: 16 bits
-    # Destination Port: 16 bits
-    # Sequence Number: 32 bits
-    # Acknowledgment Number (if ACK set): 32 bits
-    # Data Offset in 32 bit words: 4 bits
-    # Reserved: 3 bits
-    # Flags: 9 bits
-    # Window Size in Bytes: 16 bits
-    # Checksum: 16 bits
-    # Urgent Pointer: 16 bits
-    # Options (if data offset > 5: padded at the end with "0" bytes): 0-320 bits, divisible by 32
-    tcp_src_port = 1234
-    tcp_dest_port = 3000 
-    tcp_seq = 0
-    tcp_ack_num = 0
-    tcp_data_offset = 5
-    tcp_reserved = 0
-    tcp_flags = TCP.SYN
-    tcp_window = socket.htons(5840)
-    tcp_cs = 0
-    tcp_urgent_ptr = 0
+class TCPIPHeader:
+    """
+    Combined TCP/IP Header
+    """
+    def __init__(
+            self,
+            source,
+            dest,
+            id = os.getpid() & 0xffff,
+            ttl = 255,
+            seq = 0,
+            ack = 0,
+            flags = 0,
+            window = 5840):
+        """Concats a packed IP header with a packed TCP header with is stored in self.packet"""
+        self.ip_header = IPHeader(
+                source_addr = source[0],
+                dest_addr = dest[0],
+                id = id,
+                ttl = ttl)
+        ip_header_bytes = self.ip_header.pack()
 
-    tcp_data_offset_flags = (tcp_data_offset << 12) | tcp_flags
+        self.tcp_header = TCPHeader(
+                source_port = source[1],
+                dest_port = dest[1],
+                seq = seq,
+                ack = ack,
+                flags = flags,
+                window = window
+                )
+        tcp_header_bytes = self.tcp_header.pack(source_addr = source[0], dest_addr = dest[0])
 
-    print("!HHLLHHHH", tcp_src_port, tcp_dest_port, tcp_seq, tcp_ack_num, tcp_data_offset_flags, tcp_window, tcp_cs, tcp_urgent_ptr)
-    tcp_header = struct.pack("!HHLLHHHH", tcp_src_port, tcp_dest_port, tcp_seq, tcp_ack_num, tcp_data_offset_flags, tcp_window, tcp_cs, tcp_urgent_ptr)
-
-    # TCP Pseudo Header
-    # Source Address: 32 bits
-    # Destination Address: 32 bits
-    # Padding: 8 bits
-    # Protocol: 8 bits
-    # TCP Header Length (including Payload) in Bytes: 16 bits
-    tcp_pseudo_header = struct.pack("!4s4sBBH", ip_source_addr, ip_dest_addr, 0, socket.IPPROTO_TCP, len(tcp_header))
-    
-    tcp_cs_header = tcp_pseudo_header + tcp_header
-
-    tcp_cs = checksum(tcp_cs_header)
-
-    tcp_header = struct.pack("!HHLLHHHH", tcp_src_port, tcp_dest_port, tcp_seq, tcp_ack_num, tcp_data_offset_flags, tcp_window, tcp_cs, tcp_urgent_ptr)
-
-    packet = ip_header + tcp_header
-
-    print(packet)
-    tcp_socket.sendto(packet, (dest_ip, 1))
+        self.packet = ip_header_bytes + tcp_header_bytes
 
 if __name__ == "__main__":
     send_tcp_syn()
